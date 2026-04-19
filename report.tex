@@ -1,0 +1,385 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{enumitem}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  pdftitle={Query Optimization and Indexing -- pySimpleDB Project Report}
+}
+
+\lstdefinestyle{sqlstyle}{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{gray!80!black},
+  stringstyle=\color{green!40!black},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single
+}
+
+\lstdefinestyle{pystyle}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{gray!80!black},
+  stringstyle=\color{green!40!black},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single
+}
+
+\title{Query Optimization and Indexing\\in a Lightweight DB Engine\\[6pt]
+  \large pySimpleDB Project Report}
+\author{
+  \textbf{Group 5}\\[6pt]
+  \begin{tabular}{l l}
+    2023B4A70727H & Chaitanya Keyal \\
+    2023B3A70482H & Arpit \\
+    2023B4A70611H & Vishesh Agarwal \\
+    2023B4A71256H & Abhishek Verma \\
+    2023B5A71363H & Aayush Deshpande \\
+    2023B4A70757H & Gunika Gupta \\
+  \end{tabular}
+}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ==========================================================
+\section{Introduction}
+% ==========================================================
+
+\texttt{pySimpleDB} is a lightweight educational database engine that supports basic query execution but lacks effective query optimization and proper index structures. The goal of this project is to extend the system with:
+
+\begin{itemize}[nosep]
+  \item \textbf{Join order optimization} -- reorder cartesian products to minimize intermediate result sizes and push selection conditions as early as possible.
+  \item \textbf{B-tree indexes} -- in-memory B+ tree supporting insertion and equality search, integrated into query execution.
+  \item \textbf{Composite indexes} -- multi-attribute indexes for exact-match lookups on combinations of fields.
+\end{itemize}
+
+All implementation is confined to \texttt{solution.py}. The solution is designed to be fully general: it makes no hardcoded assumptions about schema or query structure, so it works correctly on any schema and query supplied via \texttt{benchmark.py}.
+
+% ==========================================================
+\section{Schema}
+% ==========================================================
+
+The benchmark schema consists of five tables:
+
+\begin{lstlisting}[style=sqlstyle,language=SQL]
+Student(s_id INT PK, s_name VARCHAR(50),
+        s_department VARCHAR(30), s_year INT)
+
+Instructor(i_id INT PK, i_name VARCHAR(50),
+           i_department VARCHAR(30))
+
+Course(c_id INT PK, c_title VARCHAR(100),
+       c_department VARCHAR(30), c_credits INT)
+
+Section(sec_id INT PK, sec_course_id INT,
+        sec_instructor_id INT, sec_semester VARCHAR(10),
+        sec_year INT)
+
+Enrollment(e_id INT PK, e_student_id INT,
+           e_section_id INT, e_grade CHAR(2))
+\end{lstlisting}
+
+\noindent\textbf{Dataset size:} 100 Students, 50 Instructors, 20 Courses, 300 Sections, 500 Enrollments. Block size 8192 bytes, buffer pool 1000 buffers, random seed 42.
+
+% ==========================================================
+\section{Queries}
+% ==========================================================
+
+\begin{lstlisting}[style=sqlstyle,language=SQL,caption={Q1 -- Students enrolled in CS courses}]
+SELECT s_id, s_name
+FROM Student, Enrollment, Section, Course
+WHERE s_id = e_student_id
+  AND e_section_id = sec_id
+  AND sec_course_id = c_id
+  AND c_department = 'CS'
+\end{lstlisting}
+
+\begin{lstlisting}[style=sqlstyle,language=SQL,caption={Q2 -- Students with grade NC}]
+SELECT s_id, s_name
+FROM Student, Enrollment
+WHERE s_id = e_student_id
+  AND e_grade = 'NC'
+\end{lstlisting}
+
+\begin{lstlisting}[style=sqlstyle,language=SQL,caption={Q3 -- Instructors teaching Fall 2024}]
+SELECT i_id, i_name
+FROM Instructor, Section
+WHERE i_id = sec_instructor_id
+  AND sec_semester = 'Fall'
+  AND sec_year = 2024
+\end{lstlisting}
+
+% ==========================================================
+\section{Solution Design}
+% ==========================================================
+
+\subsection{Execution Modes}
+
+The system supports four execution modes controlled by the \texttt{--mode} flag:
+
+\begin{itemize}[nosep]
+  \item \textbf{baseline:} Default \texttt{BasicQueryPlanner} — no optimization, no indexes.
+        Cartesian products formed in the order tables appear in the query.
+  \item \textbf{opt:} \texttt{BetterQueryPlanner} — greedy join reordering and selection
+        pushdown, no indexes.
+  \item \textbf{index:} \texttt{IndexQueryPlanner} with indexes; original join order
+        preserved. Index scans replace full table scans wherever a matching condition exists.
+  \item \textbf{full:} Like \texttt{index}, but also applies greedy join reordering
+        via the \texttt{better\_planner} parameter.
+\end{itemize}
+
+\subsection{BetterQueryPlanner}
+
+\texttt{BetterQueryPlanner} implements two classical query optimization techniques:
+
+\paragraph{Selection pushdown.}
+All predicate terms are first classified into \emph{single-table} terms (both fields belong to one table) and \emph{join} terms (fields span multiple tables). Single-table terms are wrapped in a \texttt{SelectPlan} immediately on top of the \texttt{TablePlan} for that table, before any joins are formed. This prunes rows as early as possible.
+
+\paragraph{Greedy join reordering.}
+Tables are sorted by \texttt{recordsOutput()} and joined one at a time. At each step, the algorithm prefers a table that has at least one join term connecting it to the already-built plan (avoiding a pure cross product). Among qualifying tables, it picks the one with the fewest output rows. If no table has a connecting join term, the smallest remaining table is picked as a fallback. Each applicable join term is applied immediately as a \texttt{SelectPlan} after the corresponding \texttt{ProductPlan}.
+
+\subsection{BTreeIndex}
+
+\texttt{BTreeIndex} is an in-memory B+ tree with order 50 (splits occur at 50 keys per node).
+
+\begin{itemize}[nosep]
+  \item \textbf{Leaf nodes} store \texttt{list[RecordID]} per key to handle duplicate values.
+  \item \textbf{Internal nodes} store separator keys and child pointers.
+  \item \textbf{Search} traverses from root to the correct leaf using standard B-tree comparison, then returns a copy of the RID list for the matching key.
+  \item \textbf{Insertion} recurses down to the leaf and splits upward if a node reaches the order limit. A new root is created when the root itself splits.
+  \item Leaves are linked via \texttt{next} pointers, supporting range scans if needed.
+\end{itemize}
+
+\subsection{CompositeIndex}
+
+\texttt{CompositeIndex} is a hash map keyed on \texttt{tuple(field\_values)}. It supports exact-match lookups on an ordered combination of fields in O(1) average time. This is used for Q3's two-field filter on \texttt{Section} (\texttt{sec\_semester} and \texttt{sec\_year}).
+
+\subsection{IndexScan and IndexScan Plan}
+
+\texttt{IndexScan} replaces a full \texttt{TableScan} for equality selections. It:
+\begin{enumerate}[nosep]
+  \item Calls \texttt{index.search(key)} once at construction to retrieve all matching \texttt{RecordID}s.
+  \item Iterates through them, positioning a \texttt{TableScan} at each via \texttt{moveToRecordID}.
+\end{enumerate}
+
+The corresponding plan node \texttt{\_IndexPlan} reports \texttt{blocksAccessed() = 1} (one index lookup) regardless of the number of matching rows.
+
+\subsection{IndexJoinScan and IndexJoinPlan}
+
+\texttt{IndexJoinScan} implements an index nested-loop join for field\,=\,field join conditions. For each row in the outer scan it calls \texttt{index.search(outer\_field\_value)} and seeks the inner \texttt{TableScan} to each returned RID. This avoids the full rescan of the inner table that \texttt{ProductScan} would require.
+
+An optional \texttt{inner\_pred} allows additional selection filters on the inner table
+to be applied inline, avoiding a separate \texttt{SelectPlan} wrapper.
+
+The corresponding plan node \texttt{\_IndexJoinPlan} wraps \texttt{IndexJoinScan}. It reports
+\texttt{blocksAccessed()} as \texttt{outer.blocksAccessed() + 1}, since only one index
+lookup per outer row is needed.
+
+\subsection{IndexQueryPlanner}
+
+\texttt{IndexQueryPlanner} supports both \texttt{index} and \texttt{full} modes via a single \texttt{better\_planner} parameter:
+
+\begin{itemize}[nosep]
+  \item \textbf{index mode} (\texttt{better\_planner=None}): tables are processed in original query order. For each table, the planner first checks whether a join index exists to connect it to the current plan (uses \texttt{IndexJoinScan}). Failing that, it checks for a constant equality index on single-table terms (uses \texttt{IndexScan}). Otherwise, it falls back to \texttt{ProductPlan + SelectPlan}.
+  \item \textbf{full mode} (\texttt{better\_planner} is set): the same per-table index substitution logic applies, but the table ordering is determined by the same greedy reordering as \texttt{BetterQueryPlanner}.
+\end{itemize}
+
+\subsection{create\_indexes}
+
+\texttt{create\_indexes} builds all indexes in a single pass per table:
+
+\begin{enumerate}[nosep]
+  \item Instantiate \texttt{BTreeIndex} objects for each entry in \texttt{index\_defs}.
+  \item Instantiate \texttt{CompositeIndex} objects for each entry in \texttt{composite\_index\_defs}.
+  \item Scan each table once, inserting into all applicable B-tree and composite indexes.
+\end{enumerate}
+
+This minimizes I/O during index construction. The returned \texttt{indexes} dict maps \texttt{table\_name -> \{field\_key: index\_object\}} where \texttt{field\_key} is a string for B-tree indexes and a tuple of strings for composite indexes.
+
+% ==========================================================
+\section{Benchmark Results}
+% ==========================================================
+
+\subsection{Dataset and Configuration}
+
+\begin{itemize}[nosep]
+  \item 100 Students, 50 Instructors, 20 Courses, 300 Sections, 500 Enrollments
+  \item Block size: 8192 bytes; Buffer pool: 1000 buffers; Random seed: 42
+\end{itemize}
+
+\subsection{Q1 Results}
+
+\begin{lstlisting}[style=sqlstyle,language=SQL]
+SELECT s_id, s_name FROM Student, Enrollment, Section, Course
+WHERE s_id = e_student_id AND e_section_id = sec_id
+  AND sec_course_id = c_id AND c_department = 'CS'
+\end{lstlisting}
+
+\begin{center}
+  \begin{tabular}{l r r r}
+    \toprule
+    \textbf{Mode} & \textbf{Rows} & \textbf{Time (s)} & \textbf{Block Accesses} \\
+    \midrule
+    baseline      & 103           & 1183.3422         & 6,018,099               \\
+    opt           & 103           & 0.2503            & 353                     \\
+    index         & 103           & 0.0207            & 329                     \\
+    full          & 103           & 0.0078            & 96                      \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+\subsection{Q2 Results}
+
+\begin{lstlisting}[style=sqlstyle,language=SQL]
+SELECT s_id, s_name FROM Student, Enrollment
+WHERE s_id = e_student_id AND e_grade = 'NC'
+\end{lstlisting}
+
+\begin{center}
+  \begin{tabular}{l r r r}
+    \toprule
+    \textbf{Mode} & \textbf{Rows} & \textbf{Time (s)} & \textbf{Block Accesses} \\
+    \midrule
+    baseline      & 86            & 0.2019            & 1011                    \\
+    opt           & 86            & 0.1958            & 207                     \\
+    index         & 86            & 0.0102            & 158                     \\
+    full          & 86            & 0.0037            & 158                     \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+\subsection{Q3 Results}
+
+\begin{lstlisting}[style=sqlstyle,language=SQL]
+SELECT i_id, i_name FROM Instructor, Section
+WHERE i_id = sec_instructor_id
+  AND sec_semester = 'Fall' AND sec_year = 2024
+\end{lstlisting}
+
+\begin{center}
+  \begin{tabular}{l r r r}
+    \toprule
+    \textbf{Mode} & \textbf{Rows} & \textbf{Time (s)} & \textbf{Block Accesses} \\
+    \midrule
+    baseline      & 25            & 0.1121            & 310                     \\
+    opt           & 25            & 0.0612            & 107                     \\
+    index         & 25            & 0.0032            & 79                      \\
+    full          & 25            & 0.0027            & 79                      \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+% ==========================================================
+\section{Observations and Analysis}
+% ==========================================================
+
+\subsection{Baseline vs.\ Opt: Effect of Join Reordering and Pushdown}
+
+In baseline mode, the executor forms the full cartesian product in the order tables appear in the query. For Q1 this is \texttt{Student $\times$ Enrollment $\times$ Section $\times$ Course} -- approximately $100 \times 500 \times 300 \times 20 = 300{,}000{,}000$ candidate tuples before any filtering. This results in 6,018,099 block accesses and takes over 19 minutes.
+
+Opt mode reduces this drastically:
+\begin{itemize}[nosep]
+  \item \textbf{Q1:} \texttt{c\_department='CS'} reduces Course from 20 to 4 rows before it enters any join. The greedy order joins Course first, producing only 4 rows, then chains outward. Block accesses drop from 6,018,099 to 353 -- a \textbf{17,054$\times$} reduction.
+  \item \textbf{Q2:} \texttt{e\_grade='NC'} filters Enrollment from 500 to 86 rows before joining. Accesses drop from 1011 to 207 -- a \textbf{4.9$\times$} reduction.
+  \item \textbf{Q3:} \texttt{sec\_semester='Fall'} and \texttt{sec\_year=2024} together filter Section from 300 to 25 rows. Accesses drop from 310 to 107 -- a \textbf{2.9$\times$} reduction.
+\end{itemize}
+
+\subsection{Opt vs.\ Index: Effect of Indexing}
+
+Index mode keeps the original join order but substitutes \texttt{IndexJoinScan} for
+field\,=\,field joins and \texttt{IndexScan} for equality selections. Each join does one
+index lookup per outer row rather than a full inner table rescan, so block accesses
+fall across all three queries:
+
+\begin{itemize}[nosep]
+  \item \textbf{Q1:} 353 $\to$ 329. The join order is unchanged (Student first), but \texttt{IndexJoinScan} avoids rescanning Enrollment, Section, and Course on every iteration.
+  \item \textbf{Q2:} 207 $\to$ 158. \texttt{IndexJoinScan} on \texttt{e\_student\_id} replaces the full Enrollment scan driven by each Student row.
+  \item \textbf{Q3:} 107 $\to$ 79. The composite index on \texttt{(sec\_semester, sec\_year)} returns only the 25 matching Section rows directly, avoiding a scan of all 300.
+\end{itemize}
+
+\subsection{Full Mode: Combined Effect}
+
+Full mode applies greedy reordering on top of index scans. This gives the best result for Q1:
+
+\begin{itemize}[nosep]
+  \item \textbf{Q1:} The plan starts from the 4 filtered Course rows (via index on \texttt{c\_department}), then chains \texttt{IndexJoinScan} lookups outward through Section, Enrollment, and Student. Block accesses drop to 96 -- a \textbf{62,689$\times$} improvement over baseline.
+  \item \textbf{Q2/Q3:} These are two-table queries; join reordering has no effect. Full mode produces identical block access counts to index mode (158 and 79 respectively).
+\end{itemize}
+
+% ==========================================================
+\section{Implementation Notes}
+% ===========================================================
+
+\subsection{Generality}
+
+The solution makes no hardcoded assumptions about schema, table names, or field names. All index lookups are driven by the \texttt{index\_defs} and \texttt{composite\_index\_defs} dicts passed to \texttt{create\_indexes}. The planners work by inspecting \texttt{plan\_schema()} and predicate term fields at runtime. This was verified by running all modes against an unrelated schema (Product/Orders) and confirming correct results.
+
+\subsection{Index Population}
+
+All indexes for a given table are populated in a single \texttt{TableScan} pass. For each record, both B-tree and composite indexes are updated simultaneously. This minimizes I/O during index construction.
+
+\subsection{Duplicate Handling}
+
+B-tree leaf nodes store \texttt{list[RecordID]} per key rather than a single RID. This correctly handles non-unique index fields (e.g., multiple students in the same department, multiple sections in the same semester).
+
+\subsection{Block Access Counting}
+
+\texttt{block\_accesses} counts every \texttt{BufferMgr.pin()} call, including buffer-pool
+hits. Even accesses served from cached buffers are counted, so the numbers reflect
+memory-level access patterns rather than pure disk I/O.
+
+\begin{center}
+  \begin{tabular}{l p{9.5cm}}
+    \toprule
+    \textbf{Component}          & \textbf{Description}                                         \\
+    \midrule
+    \texttt{BetterQueryPlanner} & Classifies terms into single-table (pushdown) and join
+    conditions. Greedy join order by \texttt{recordsOutput()};
+    applies each join predicate after the \texttt{ProductPlan}.                                \\
+    \texttt{BTreeIndex}         & In-memory B+ tree (order~50). Leaf nodes store
+    \texttt{list[RecordID]} per key to handle duplicate
+    key values.                                                                                \\
+    \texttt{CompositeIndex}     & Hash map keyed on \texttt{tuple(field\_values)}.
+    O(1) exact-match lookup on all indexed fields.                                             \\
+    \texttt{IndexScan}          & Retrieves \texttt{list[RecordID]} from the index, then seeks
+    a \texttt{TableScan} to each RID via \texttt{moveToRecordID}.                              \\
+    \texttt{IndexJoinScan}      & For each outer row, calls \texttt{index.search(value)} and
+    seeks the inner \texttt{TableScan} to each matching RID.
+    Accepts \texttt{inner\_pred} for inline selection filters.                                 \\
+    \texttt{IndexQueryPlanner}  & \textit{index} mode: original join order with index scans
+    substituted. \textit{full} mode: greedy reordering on top of
+    index scans, driven by \texttt{better\_planner}.                                           \\
+    \texttt{create\_indexes}    & Single table scan per table to populate all B-tree and
+    composite indexes.                                                                         \\
+    \bottomrule
+  \end{tabular}
+\end{center}
+
+% ==========================================================
+\section{Conclusion}
+% ==========================================================
+
+This project implements three layers of query optimization in pySimpleDB. Selection pushdown and join reordering (\texttt{opt} mode) alone yield a 17,000$\times$ improvement on Q1. Adding index scans (\texttt{index} mode) further reduces access counts and wall-clock time, especially for highly selective equality conditions. Combining both techniques (\texttt{full} mode) delivers the best performance overall, reducing Q1 from 6,018,099 block accesses to 96 -- a 62,689$\times$ improvement over baseline.
+
+All results are consistent across query runs and produce the correct row counts (103 for Q1, 86 for Q2, 25 for Q3). The implementation is fully general and does not rely on any schema-specific assumptions.
+
+\end{document}
